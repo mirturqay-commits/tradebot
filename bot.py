@@ -6,9 +6,10 @@ import requests
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- GÜVENLİĞE ALINMIŞ TELEGRAM AYARLARI ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# --- TELEGRAM AYARLARI ---
+# Eğer GitHub Secrets tanımladıysan oradan alır, tanımlamadıysan aşağıdaki varsayılan değerleri kullanır.
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8824923981:AAEfvNLsQRDLpR4UWijCACltFF30HIHY47Q")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@OnyxTradeTR")
 
 def send_telegram_message(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
