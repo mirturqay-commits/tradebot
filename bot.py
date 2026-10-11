@@ -7,7 +7,6 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- TELEGRAM AYARLARI ---
-# Eğer GitHub Secrets tanımladıysan oradan alır, tanımlamadıysan aşağıdaki varsayılan değerleri kullanır.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8824923981:AAEfvNLsQRDLpR4UWijCACltFF30HIHY47Q")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@OnyxTradeTR")
 
@@ -29,103 +28,159 @@ def send_telegram_message(message):
 
 def check_and_send(df, symbol, market_type):
     try:
-        if df is None or len(df) < 60:
+        if df is None or len(df) < 200:
             return
             
-        df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+        # 1. Trend Filtresi (200 EMA)
+        df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
         
-        left_bars = 5
-        right_bars = 5
+        # 2. Donchian Kanalı (20 Dönem Kırılımı)
+        df['high_20'] = df['high'].rolling(window=20).max().shift(1)
+        df['low_20'] = df['low'].rolling(window=20).min().shift(1)
         
-        last_pivot_high = None
-        for i in range(len(df) - right_bars - 2, left_bars, -1):
-            is_high = True
-            current_high = df['high'].iloc[i]
-            for j in range(1, left_bars + 1):
-                if df['high'].iloc[i - j] >= current_high:
-                    is_high = False
-            for j in range(1, right_bars + 1):
-                if df['high'].iloc[i + j] >= current_high:
-                    is_high = False
-            if is_high:
-                last_pivot_high = current_high
-                break
+        # 3. Hacim Onay Filtresi (20 Dönem Hacim Ortalaması)
+        df['vol_ma20'] = df['volume'].rolling(window=20).mean()
         
-        if last_pivot_high is None:
-            return
+        # 4. RSI Momentum Filtresi (14 Dönem)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # 5. ATR (Volatilite ve Risk Hesaplama)
+        high_low = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close = (df['low'] - df['close'].shift()).abs()
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        df['atr'] = ranges.max(axis=1).rolling(14).mean()
 
         current_close = df['close'].iloc[-2]
-        current_high = df['high'].iloc[-2]
-        current_open = df['open'].iloc[-2]
-        current_ema50 = df['ema50'].iloc[-2]
+        current_ema200 = df['ema200'].iloc[-2]
+        high_20 = df['high_20'].iloc[-2]
+        low_20 = df['low_20'].iloc[-2]
+        current_atr = df['atr'].iloc[-2]
+        current_vol = df['volume'].iloc[-2]
+        vol_ma20 = df['vol_ma20'].iloc[-2]
+        current_rsi = df['rsi'].iloc[-2]
         
-        is_near_resistance = (last_pivot_high * 0.998) <= current_high <= (last_pivot_high * 1.005)
-        is_below_ema = current_close < current_ema50
-        is_bearish = current_close < current_open
+        is_volume_confirmed = current_vol > vol_ma20
         
-        if is_near_resistance and is_below_ema and is_bearish:
+        # --- LONG SİNYALİ ---
+        if current_close > current_ema200 and current_close > high_20 and is_volume_confirmed and current_rsi > 50:
             entry_price = current_close
-            stop_loss = last_pivot_high * 1.002
-            risk = stop_loss - entry_price
-            take_profit = entry_price - (risk * 2.0)
+            stop_loss = entry_price - (current_atr * 2.0)
+            take_profit = entry_price + (current_atr * 4.0)
             
             message = (
-                f"🚨 *PROFESYONEL SHORT SİNYALİ ({market_type})* 🚨\n\n"
+                f"🟢 *PRO DONCHIAN LONG ({market_type})* 🟢\n\n"
                 f"🏷 *Varlık:* `{symbol}`\n"
-                f"📉 *Giriş Fiyatı:* `{entry_price:.5f}`\n"
-                f"🛑 *Stop Loss:* `{stop_loss:.5f}`\n"
-                f"🎯 *Take Profit:* `{take_profit:.5f}`\n"
-                f"📊 *Direnç Seviyesi:* `{last_pivot_high:.5f}`"
+                f"📈 *Giriş:* `{entry_price:.5f}`\n"
+                f"🛑 *Stop:* `{stop_loss:.5f}`\n"
+                f"🎯 *Hedef:* `{take_profit:.5f}`\n"
+                f"📊 *RSI:* `{current_rsi:.1f}` | *Hacim:* `Onaylı`"
             )
-            
             send_telegram_message(message)
-            print(f"Sinyal gönderildi: {symbol}")
+            return
+
+        # --- SHORT SİNYALİ ---
+        if current_close < current_ema200 and current_close < low_20 and is_volume_confirmed and current_rsi < 50:
+            entry_price = current_close
+            stop_loss = entry_price + (current_atr * 2.0)
+            take_profit = entry_price - (current_atr * 4.0)
+            
+            message = (
+                f"🔴 *PRO DONCHIAN SHORT ({market_type})* 🔴\n\n"
+                f"🏷 *Varlık:* `{symbol}`\n"
+                f"📉 *Giriş:* `{entry_price:.5f}`\n"
+                f"🛑 *Stop:* `{stop_loss:.5f}`\n"
+                f"🎯 *Hedef:* `{take_profit:.5f}`\n"
+                f"📊 *RSI:* `{current_rsi:.1f}` | *Hacim:* `Onaylı`"
+            )
+            send_telegram_message(message)
             
     except Exception as e:
         pass
 
-def analyze_crypto(symbol):
+def analyze_crypto_spot(symbol):
     try:
-        exchange = ccxt.binance({'options': {'defaultType': 'future'}, 'enableRateLimit': True})
-        ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=100)
+        exchange = ccxt.binance({'enableRateLimit': True})
+        ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=250)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        check_and_send(df, symbol, "KRİPTO")
+        check_and_send(df, symbol, "KRİPTO SPOT")
     except Exception:
         pass
 
-def analyze_yahoo(symbol, market_type):
+def analyze_crypto_future(symbol):
     try:
-        df = yf.download(symbol, interval='1h', period='5d', progress=False)
-        if not df.empty:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df = df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
-            check_and_send(df, symbol, market_type)
+        exchange = ccxt.binance({'options': {'defaultType': 'future'}, 'enableRateLimit': True})
+        ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=250)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        check_and_send(df, symbol, "KRİPTO VADELİ")
+    except Exception:
+        pass
+
+def analyze_yahoo_batch(symbols, market_type):
+    try:
+        data = yf.download(symbols, interval='1h', period='15d', group_by='ticker', progress=False, threads=True)
+        for symbol in symbols:
+            try:
+                if len(symbols) == 1:
+                    df = data.copy()
+                else:
+                    df = data[symbol].copy()
+                
+                if df is not None and not df.empty:
+                    df = df.dropna()
+                    df = df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
+                    check_and_send(df, symbol, market_type)
+            except:
+                continue
     except Exception:
         pass
 
 def run_scanner():
-    print(f"\n[{datetime.now()}] Profesyonel tarama başlatıldı...")
+    print(f"\n[{datetime.now()}] 5000+ Varlık Dev Tarama (Donchian + EMA200 + Hacim + RSI + ATR) Başlatıldı...")
 
+    # 1. Binance Spot Piyasası
     try:
-        ex = ccxt.binance({'options': {'defaultType': 'future'}})
-        markets = ex.load_markets()
-        crypto_list = [s for s in markets if '/USDT' in s and ':' not in s][:300]
+        ex_spot = ccxt.binance()
+        spot_markets = ex_spot.load_markets()
+        spot_list = [s for s in spot_markets if '/USDT' in s and ':' not in s]
     except:
-        crypto_list = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+        spot_list = []
 
-    forex_list = ['EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X', 'GC=F', 'CL=F']
-    stock_list = ['THYAO.IS', 'GARAN.IS', 'AKBNK.IS', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA']
+    # 2. Binance Vadeli Piyasası
+    try:
+        ex_fut = ccxt.binance({'options': {'defaultType': 'future'}})
+        fut_markets = ex_fut.load_markets()
+        fut_list = [s for s in fut_markets if '/USDT' in s and ':' not in s]
+    except:
+        fut_list = []
 
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = [executor.submit(analyze_crypto, sym) for sym in crypto_list]
-        futures += [executor.submit(analyze_yahoo, sym, "FOREX/EMTİA") for sym in forex_list]
-        futures += [executor.submit(analyze_yahoo, sym, "HİSSE SENEDİ") for sym in stock_list]
+    # 3. Küresel Piyasa (Forex, Emtia, BIST ve ABD Hisseleri)
+    forex_commodities = ['EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X', 'USDCAD=X', 'NZDUSD=X', 'GC=F', 'SI=F', 'CL=F', 'NG=F', 'BZ=F']
+    bist_list = [f"{s}.IS" for s in ['THYAO', 'GARAN', 'AKBNK', 'EREGL', 'KCHOL', 'SAHOL', 'ASELS', 'BIMAS', 'TUPRS', 'YKBNK', 'ISCTR', 'KRDMD', 'PETKM', 'SASA', 'HEKTS']]
+    us_stocks = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'NFLX', 'AMD', 'INTC', 'JPM', 'V', 'MA', 'DIS', 'PYPL']
+
+    all_stocks = forex_commodities + bist_list + us_stocks
+
+    print(f"Toplam Taranacak Kripto (Spot + Vadeli): {len(spot_list) + len(fut_list)}")
+    print(f"Toplam Taranacak Hisse/Emtia/Forex: {len(all_stocks)}")
+
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        futures = [executor.submit(analyze_crypto_spot, sym) for sym in spot_list]
+        futures += [executor.submit(analyze_crypto_future, sym) for sym in fut_list]
+        
+        chunk_size = 20
+        for i in range(0, len(all_stocks), chunk_size):
+            chunk = all_stocks[i:i + chunk_size]
+            futures.append(executor.submit(analyze_yahoo_batch, chunk, "KÜRESEL PİYASA"))
 
         for future in as_completed(futures):
             pass
 
-    print("Tarama tamamlandı.")
+    print("Dev tarama tamamlandı.")
 
 if __name__ == "__main__":
     run_scanner()
