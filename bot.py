@@ -6,14 +6,14 @@ import numpy as np
 import requests
 import json
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- TELEGRAM AYARLARI ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8824923981:AAEfvNLsQRDLpR4UWijCACltFF30HIHY47Q")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@OnyxTradeTR")
 
-# --- KİLİT MEKANİZMASI ---
+# --- KİLİT VE COOLDOWN MEKANİZMASI ---
 portfolio_lock = threading.Lock()
 PORTFOLIO_FILE = "paper_portfolio.json"
 
@@ -69,20 +69,20 @@ def update_and_check_positions(symbol, current_price):
             if side == "LONG":
                 if current_price <= sl:
                     closed = True
-                    result = "STOP-LOSS"
+                    result = "STOP-LOSS 🛑"
                     pnl = sl - entry
                 elif current_price >= tp:
                     closed = True
-                    result = "TAKE-PROFIT"
+                    result = "TAKE-PROFIT 🎯"
                     pnl = tp - entry
             elif side == "SHORT":
                 if current_price >= sl:
                     closed = True
-                    result = "STOP-LOSS"
+                    result = "STOP-LOSS 🛑"
                     pnl = entry - sl
                 elif current_price <= tp:
                     closed = True
-                    result = "TAKE-PROFIT"
+                    result = "TAKE-PROFIT 🎯"
                     pnl = entry - tp
 
             if closed:
@@ -98,13 +98,13 @@ def update_and_check_positions(symbol, current_price):
 
                 emoji = "🟢" if pnl > 0 else "🔴"
                 msg = (
-                    f"{emoji} *İŞLEM KAPANDI ({result})* {emoji}\n\n"
+                    f"{emoji} *İŞLEM KAPANDI - {result}* {emoji}\n\n"
                     f"🏷 *Varlık:* `{symbol}`\n"
                     f"📈 *Yön:* `{side}`\n"
-                    f"🎯 *Giriş:* `{entry:.5f}`\n"
-                    f"🏁 *Çıkış:* `{current_price:.5f}`\n"
-                    f"💰 *Kâr/Zarar:* `{pnl:.5f}`\n"
-                    f"💼 *Güncel Bakiye:* `${portfolio['balance']:.2f}`"
+                    f"🎯 *Giriş Fiyatı:* `{entry:.5f}`\n"
+                    f"🏁 *Kapanış Fiyatı:* `{current_price:.5f}`\n"
+                    f"💰 *Net Kâr/Zarar:* `{pnl:.5f}`\n"
+                    f"💼 *Güncel Sanal Bakiye:* `${portfolio['balance']:.2f}`"
                 )
                 send_telegram_message(msg)
 
@@ -115,9 +115,19 @@ def update_and_check_positions(symbol, current_price):
 def open_paper_trade(symbol, side, entry, sl, tp, market_type):
     with portfolio_lock:
         portfolio = load_portfolio()
+        
+        # 1. Zaten açık pozisyon varsa açma
         for pos in portfolio["positions"]:
             if pos["symbol"] == symbol and pos["status"] == "OPEN":
                 return
+
+        # 2. Spam Önleme (Cooldown): Son 24 saat içinde aynı varlıkta işlem açıldıysa tekrar açma
+        recent_cutoff = datetime.now() - timedelta(hours=24)
+        for pos in portfolio.get("closed_trades", []):
+            if pos["symbol"] == symbol:
+                close_t = datetime.strptime(pos["close_time"].split('.')[0], "%Y-%m-%d %H:%M:%S")
+                if close_t > recent_cutoff:
+                    return
 
         trade = {
             "id": len(portfolio["positions"]) + len(portfolio["closed_trades"]) + 1,
@@ -136,7 +146,7 @@ def open_paper_trade(symbol, side, entry, sl, tp, market_type):
 
     emoji = "🟢" if side == "LONG" else "🔴"
     message = (
-        f"{emoji} *ÇOKLU İNDİKATÖR TEYİTLİ SİNYAL* {emoji}\n\n"
+        f"{emoji} *YENİ DOĞRULANMIŞ SİNYAL* {emoji}\n\n"
         f"🏷 *Varlık:* `{symbol}` ({market_type})\n"
         f"📈 *Yön:* `{side}`\n"
         f"🎯 *Giriş:* `{entry:.5f}`\n"
@@ -153,7 +163,6 @@ def calculate_advanced_indicators(df):
     close = df['close']
     high = df['high']
     low = df['low']
-    volume = df['volume']
 
     # 1. Hull Moving Average (HullMA)
     half_length = int(9 / 2)
@@ -201,7 +210,7 @@ def calculate_advanced_indicators(df):
     df['wt1'] = ci.ewm(span=21, adjust=False).mean()
     df['wt2'] = df['wt1'].rolling(4).mean()
 
-    # 5. TrendSpeed Analyzer (Fiyat Değişim Hızı)
+    # 5. TrendSpeed Analyzer
     df['trend_speed'] = close.diff(5)
 
     # 6. RSI (14)
@@ -228,7 +237,6 @@ def process_signals(df_1h, symbol, market_type):
         current_close = df['close'].iloc[-2]
         update_and_check_positions(symbol, current_close)
 
-        # Değerler
         st = df['supertrend'].iloc[-2]
         hull = df['hull_ma'].iloc[-2]
         hull_prev = df['hull_ma'].iloc[-3]
@@ -250,7 +258,7 @@ def process_signals(df_1h, symbol, market_type):
         is_st_bullish = st == True
         is_hull_bullish = hull > hull_prev
         is_macd_bullish = macd > macd_sig
-        is_wt_bullish = (wt1 > wt2) and (wt1_prev <= wt2_prev)  # WT Cross LB yukarı kesişim
+        is_wt_bullish = (wt1 > wt2) and (wt1_prev <= wt2_prev)
         is_speed_bullish = t_speed > 0
         is_rsi_bullish = rsi > 50
         is_cci_bullish = cci > 0
@@ -266,7 +274,7 @@ def process_signals(df_1h, symbol, market_type):
         is_st_bearish = st == False
         is_hull_bearish = hull < hull_prev
         is_macd_bearish = macd < macd_sig
-        is_wt_bearish = (wt1 < wt2) and (wt1_prev >= wt2_prev)  # WT Cross LB aşağı kesişim
+        is_wt_bearish = (wt1 < wt2) and (wt1_prev >= wt2_prev)
         is_speed_bearish = t_speed < 0
         is_rsi_bearish = rsi < 50
         is_cci_bearish = cci < 0
@@ -338,7 +346,7 @@ def send_performance_summary():
     send_telegram_message(msg)
 
 def run_scanner():
-    print(f"\n[{datetime.now()}] Çoklu İndikatör Teyitli Tarama Başlatıldı...")
+    print(f"\n[{datetime.now()}] Akıllı Anti-Spam Tarama Başlatıldı...")
 
     try:
         ex_spot = ccxt.binance()
