@@ -116,13 +116,11 @@ def open_paper_trade(symbol, side, entry, sl, tp, market_type):
     with portfolio_lock:
         portfolio = load_portfolio()
         
-        # 1. Zaten açık pozisyon varsa açma
         for pos in portfolio["positions"]:
             if pos["symbol"] == symbol and pos["status"] == "OPEN":
                 return
 
-        # 2. Spam Önleme (Cooldown): Son 24 saat içinde aynı varlıkta işlem açıldıysa tekrar açma
-        recent_cutoff = datetime.now() - timedelta(hours=24)
+        recent_cutoff = datetime.now() - timedelta(hours=12) # Cooldown süresi 12 saate düşürüldü
         for pos in portfolio.get("closed_trades", []):
             if pos["symbol"] == symbol:
                 close_t = datetime.strptime(pos["close_time"].split('.')[0], "%Y-%m-%d %H:%M:%S")
@@ -146,7 +144,7 @@ def open_paper_trade(symbol, side, entry, sl, tp, market_type):
 
     emoji = "🟢" if side == "LONG" else "🔴"
     message = (
-        f"{emoji} *YENİ DOĞRULANMIŞ SİNYAL* {emoji}\n\n"
+        f"{emoji} *YENİ OPTİMİZE SİNYAL* {emoji}\n\n"
         f"🏷 *Varlık:* `{symbol}` ({market_type})\n"
         f"📈 *Yön:* `{side}`\n"
         f"🎯 *Giriş:* `{entry:.5f}`\n"
@@ -155,7 +153,6 @@ def open_paper_trade(symbol, side, entry, sl, tp, market_type):
     )
     send_telegram_message(message)
 
-# --- İNDİKATÖR HESAPLAMA MOTORU ---
 def calculate_advanced_indicators(df):
     if df is None or len(df) < 100:
         return None
@@ -164,14 +161,12 @@ def calculate_advanced_indicators(df):
     high = df['high']
     low = df['low']
 
-    # 1. Hull Moving Average (HullMA)
     half_length = int(9 / 2)
     sqrt_length = int(np.sqrt(9))
     wma_half = close.rolling(half_length).apply(lambda x: np.dot(x, np.arange(1, len(x)+1)) / np.arange(1, len(x)+1).sum(), raw=True)
     wma_full = close.rolling(9).apply(lambda x: np.dot(x, np.arange(1, len(x)+1)) / np.arange(1, len(x)+1).sum(), raw=True)
     df['hull_ma'] = (2 * wma_half - wma_full).rolling(sqrt_length).apply(lambda x: np.dot(x, np.arange(1, len(x)+1)) / np.arange(1, len(x)+1).sum(), raw=True)
 
-    # 2. Supertrend
     atr_period = 10
     multiplier = 3.0
     hl2 = (high + low) / 2
@@ -180,11 +175,10 @@ def calculate_advanced_indicators(df):
     high_close = (high - close.shift()).abs()
     low_close = (low - close.shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.rolling(atr_period).mean()
-    df['atr'] = atr
+    df['atr'] = tr.rolling(atr_period).mean()
 
-    upper_basic = hl2 + (multiplier * atr)
-    lower_basic = hl2 - (multiplier * atr)
+    upper_basic = hl2 + (multiplier * df['atr'])
+    lower_basic = hl2 - (multiplier * df['atr'])
     
     supertrend = [True] * len(df)
     for i in range(1, len(df)):
@@ -196,13 +190,11 @@ def calculate_advanced_indicators(df):
             supertrend[i] = supertrend[i-1]
     df['supertrend'] = supertrend
 
-    # 3. N MACD
     ema_fast = close.ewm(span=12, adjust=False).mean()
     ema_slow = close.ewm(span=26, adjust=False).mean()
     df['n_macd'] = ema_fast - ema_slow
     df['n_macd_signal'] = df['n_macd'].ewm(span=9, adjust=False).mean()
 
-    # 4. WaveTrend (WT_CROSS_LB)
     ap = (high + low + close) / 3
     esa = ap.ewm(span=10, adjust=False).mean()
     d = (ap - esa).abs().ewm(span=10, adjust=False).mean()
@@ -210,17 +202,14 @@ def calculate_advanced_indicators(df):
     df['wt1'] = ci.ewm(span=21, adjust=False).mean()
     df['wt2'] = df['wt1'].rolling(4).mean()
 
-    # 5. TrendSpeed Analyzer
-    df['trend_speed'] = close.diff(5)
+    df['trend_speed'] = close.diff(3)
 
-    # 6. RSI (14)
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # 7. CCI (20)
     tp = (high + low + close) / 3
     sma_tp = tp.rolling(20).mean()
     mad = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
@@ -246,40 +235,40 @@ def process_signals(df_1h, symbol, market_type):
         
         wt1 = df['wt1'].iloc[-2]
         wt2 = df['wt2'].iloc[-2]
-        wt1_prev = df['wt1'].iloc[-3]
-        wt2_prev = df['wt2'].iloc[-3]
         
         t_speed = df['trend_speed'].iloc[-2]
         rsi = df['rsi'].iloc[-2]
         cci = df['cci'].iloc[-2]
         atr = df['atr'].iloc[-2]
 
-        # --- LONG TEYİT KURALLARI ---
-        is_st_bullish = st == True
-        is_hull_bullish = hull > hull_prev
-        is_macd_bullish = macd > macd_sig
-        is_wt_bullish = (wt1 > wt2) and (wt1_prev <= wt2_prev)
-        is_speed_bullish = t_speed > 0
-        is_rsi_bullish = rsi > 50
-        is_cci_bullish = cci > 0
+        # --- DENGELİ LONG SKORLAMA (En az 5 kriter yeterli) ---
+        long_score = 0
+        if st == True: long_score += 1
+        if hull > hull_prev: long_score += 1
+        if macd > macd_sig: long_score += 1
+        if wt1 > wt2: long_score += 1
+        if t_speed > 0: long_score += 1
+        if rsi > 48: long_score += 1
+        if cci > -50: long_score += 1
 
-        if is_st_bullish and is_hull_bullish and is_macd_bullish and is_wt_bullish and is_speed_bullish and is_rsi_bullish and is_cci_bullish:
+        if long_score >= 5:
             entry = current_close
             sl = entry - (atr * 1.5)
             tp = entry + (atr * 3.0)
             open_paper_trade(symbol, "LONG", entry, sl, tp, market_type)
             return
 
-        # --- SHORT TEYİT KURALLARI ---
-        is_st_bearish = st == False
-        is_hull_bearish = hull < hull_prev
-        is_macd_bearish = macd < macd_sig
-        is_wt_bearish = (wt1 < wt2) and (wt1_prev >= wt2_prev)
-        is_speed_bearish = t_speed < 0
-        is_rsi_bearish = rsi < 50
-        is_cci_bearish = cci < 0
+        # --- DENGELİ SHORT SKORLAMA (En az 5 kriter yeterli) ---
+        short_score = 0
+        if st == False: short_score += 1
+        if hull < hull_prev: short_score += 1
+        if macd < macd_sig: short_score += 1
+        if wt1 < wt2: short_score += 1
+        if t_speed < 0: short_score += 1
+        if rsi < 52: short_score += 1
+        if cci < 50: short_score += 1
 
-        if is_st_bearish and is_hull_bearish and is_macd_bearish and is_wt_bearish and is_speed_bearish and is_rsi_bearish and is_cci_bearish:
+        if short_score >= 5:
             entry = current_close
             sl = entry + (atr * 1.5)
             tp = entry - (atr * 3.0)
@@ -346,7 +335,7 @@ def send_performance_summary():
     send_telegram_message(msg)
 
 def run_scanner():
-    print(f"\n[{datetime.now()}] Akıllı Anti-Spam Tarama Başlatıldı...")
+    print(f"\n[{datetime.now()}] Dengeli Tarama Başlatıldı...")
 
     try:
         ex_spot = ccxt.binance()
